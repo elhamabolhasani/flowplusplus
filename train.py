@@ -22,6 +22,7 @@ from tqdm import tqdm
 def main(args):
     # Set up main device and scale batch size
     device = 'cuda' if torch.cuda.is_available() and args.gpu_ids else 'cpu'
+    print(device)
     args.batch_size *= max(1, len(args.gpu_ids))
 
     # Set random seeds
@@ -143,17 +144,29 @@ def test(epoch, net, testloader, device, loss_fn, num_samples, save_dir):
                                      bpd=util.bits_per_dim(x, loss_meter.avg))
             progress_bar.update(x.size(0))
 
+        x_, _ = net(x, reverse=True)
+        reconstruction_images = torch.sigmoid(x_)
+
     # Save checkpoint
+    print('best_loss ', best_loss)
+    print('loss_meter.avg  ', loss_meter.avg)
     if loss_meter.avg < best_loss:
-        print('Saving...')
-        state = {
-            'net': net.state_dict(),
-            'test_loss': loss_meter.avg,
-            'epoch': epoch,
-        }
-        os.makedirs('save', exist_ok=True)
-        torch.save(state, 'save/best.pth.tar')
         best_loss = loss_meter.avg
+
+    print('Saving...')
+    state = {
+        'net': net.state_dict(),
+        'test_loss': loss_meter.avg,
+        'epoch': epoch,
+    }
+    os.makedirs('ckpts', exist_ok=True)
+    torch.save(state, 'ckpts/flow++_' + str(epoch) + '.pth.tar')
+
+    # Save reconstruction images
+    images = reconstruction_images
+    os.makedirs('samples', exist_ok=True)
+    images_concat = torchvision.utils.make_grid(images, nrow=int(num_samples ** 0.5), padding=2, pad_value=255)
+    torchvision.utils.save_image(images_concat, 'samples/reconstruction_epoch_{}.png'.format(epoch))
 
     # Save samples and data
     images = sample(net, num_samples, device)
@@ -169,13 +182,13 @@ if __name__ == '__main__':
     def str2bool(s):
         return s.lower().startswith('t')
 
-    parser.add_argument('--batch_size', default=8, type=int, help='Batch size per GPU')
+    parser.add_argument('--batch_size', default=4, type=int, help='Batch size per GPU')
     parser.add_argument('--benchmark', type=str2bool, default=True, help='Turn on CUDNN benchmarking')
-    parser.add_argument('--gpu_ids', default=[0, 1, 2, 3], type=eval, help='IDs of GPUs to use')
+    parser.add_argument('--gpu_ids', default=[0], type=eval, help='IDs of GPUs to use')
     parser.add_argument('--lr', default=1e-3, type=float, help='Peak learning rate')
     parser.add_argument('--max_grad_norm', type=float, default=1., help='Max gradient norm for clipping')
     parser.add_argument('--drop_prob', type=float, default=0.2, help='Dropout probability')
-    parser.add_argument('--num_blocks', default=10, type=int, help='Number of blocks in Flow++')
+    parser.add_argument('--num_blocks', default=5, type=int, help='Number of blocks in Flow++')
     parser.add_argument('--num_components', default=32, type=int, help='Number of components in the mixture')
     parser.add_argument('--num_dequant_blocks', default=2, type=int, help='Number of blocks in dequantization')
     parser.add_argument('--num_channels', default=96, type=int, help='Number of channels in Flow++')
@@ -193,4 +206,5 @@ if __name__ == '__main__':
     best_loss = 0
     global_step = 0
 
+    print(torch.__version__)
     main(parser.parse_args())
