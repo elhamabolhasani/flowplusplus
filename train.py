@@ -13,8 +13,10 @@ import torch.backends.cudnn as cudnn
 import torch.utils.data as data
 import torchvision
 import torchvision.transforms as transforms
-import util
+from torch.distributions import Independent, Normal
 
+import util
+from vae_n_d_n_l import VAE
 from models import FlowPlusPlus
 from tqdm import tqdm
 
@@ -47,7 +49,13 @@ def main(args):
     testset = torchvision.datasets.CIFAR10(root='data', train=False, download=True, transform=transform_test)
     testloader = data.DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    # Model
+    # Model vae
+    vae_net = VAE('cifar')
+    vae_net.init_model()
+    vae_net.load_state_dict(torch.load(args.vae_model_path))
+    vae_net.eval()
+
+    # Model flow++
     print('Building model..')
     net = FlowPlusPlus(scales=[(0, 4), (2, 3)],
                        in_shape=(3, 32, 32),
@@ -82,13 +90,13 @@ def main(args):
     scheduler = sched.LambdaLR(optimizer, lambda s: min(1., s / warm_up))
 
     for epoch in range(start_epoch, start_epoch + args.num_epochs):
-        train(epoch, net, trainloader, device, optimizer, scheduler,
+        train(epoch, net, vae_net,  trainloader, device, optimizer, scheduler,
               loss_fn, args.max_grad_norm)
-        test(epoch, net, testloader, device, loss_fn, args.num_samples, args.save_dir)
+        test(epoch, net, vae_net, testloader, device, loss_fn, args.num_samples, args.save_dir)
 
 
 @torch.enable_grad()
-def train(epoch, net, trainloader, device, optimizer, scheduler, loss_fn, max_grad_norm):
+def train(epoch, net, vae_net, trainloader, device, optimizer, scheduler, loss_fn, max_grad_norm):
     global global_step
     print('\nEpoch: %d' % epoch)
     net.train()
@@ -97,8 +105,15 @@ def train(epoch, net, trainloader, device, optimizer, scheduler, loss_fn, max_gr
         for x, _ in trainloader:
             x = x.to(device)
             optimizer.zero_grad()
+
+            # vae model both n
+            mu_d, logvar_d, mu, logvar = vae_net(x)
+
             z, sldj = net(x, reverse=False)
-            loss = loss_fn(z, sldj)
+
+            # loss = loss_fn(z, sldj)
+            loss = loss_fn(z, sldj, mu_d, logvar_d)
+
             loss_meter.update(loss.item(), x.size(0))
             loss.backward()
             if max_grad_norm > 0:
@@ -114,31 +129,42 @@ def train(epoch, net, trainloader, device, optimizer, scheduler, loss_fn, max_gr
 
 
 @torch.no_grad()
-def sample(net, batch_size, device):
-    """Sample from RealNVP model.
+def sample(net, vae_net, batch_size, device):
+    # assume latent features space ~ N(0, 1)
+    z = torch.randn(batch_size, vae_net.n_latent_features).to(device)
+    z = vae_net.fc4(z)
+    z = vae_net.decoder(z)
+    z = z.view(-1, vae_net.n_neurons_last_decoder_layer)
 
-    Args:
-        net (torch.nn.DataParallel): The RealNVP model wrapped in DataParallel.
-        batch_size (int): Number of samples to generate.
-        device (torch.device): Device to use.
-    """
-    z = torch.randn((batch_size, 3, 32, 32), dtype=torch.float32, device=device)
+    """ both normal """
+    mu_d, logvar_d = vae_net.decoder_bottleneck(z)
+    dist = Independent(Normal(loc=mu_d, scale=torch.exp(logvar_d)), 1)
+
+    # sample from model
+    z = dist.sample()
+    z = z.view(-1, 3, 32, 32)
+
     x, _ = net(z, reverse=True)
     x = torch.sigmoid(x)
-
     return x
 
 
 @torch.no_grad()
-def test(epoch, net, testloader, device, loss_fn, num_samples, save_dir):
+def test(epoch, net, vae_net, testloader, device, loss_fn, num_samples, save_dir):
     global best_loss
     net.eval()
     loss_meter = util.AverageMeter()
     with tqdm(total=len(testloader.dataset)) as progress_bar:
         for x, _ in testloader:
             x = x.to(device)
+
+            # vae model
+            mu_d, logvar_d, mu, logvar = vae_net(x)
+
             z, sldj = net(x, reverse=False)
-            loss = loss_fn(z, sldj)
+            # loss = loss_fn(z, sldj)
+            loss = loss_fn(z, sldj, mu_d, logvar_d)
+
             loss_meter.update(loss.item(), x.size(0))
             progress_bar.set_postfix(nll=loss_meter.avg,
                                      bpd=util.bits_per_dim(x, loss_meter.avg))
@@ -160,7 +186,7 @@ def test(epoch, net, testloader, device, loss_fn, num_samples, save_dir):
         'epoch': epoch,
     }
     os.makedirs('ckpts', exist_ok=True)
-    torch.save(state, 'ckpts/flow++_' + str(epoch) + '.pth.tar')
+    torch.save(state, 'ckpts/flow++_' + str(epoch) + 'vae(n_d_n_l_64).pth.tar')
 
     # Save reconstruction images
     images = reconstruction_images
@@ -169,7 +195,7 @@ def test(epoch, net, testloader, device, loss_fn, num_samples, save_dir):
     torchvision.utils.save_image(images_concat, 'samples/reconstruction_epoch_{}.png'.format(epoch))
 
     # Save samples and data
-    images = sample(net, num_samples, device)
+    images = sample(net, vae_net, num_samples, device)
     os.makedirs(save_dir, exist_ok=True)
     images_concat = torchvision.utils.make_grid(images, nrow=int(num_samples ** 0.5), padding=2, pad_value=255)
     torchvision.utils.save_image(images_concat,
@@ -202,6 +228,11 @@ if __name__ == '__main__':
     parser.add_argument('--warm_up', type=int, default=200, help='Number of batches for LR warmup')
     parser.add_argument('--weight_decay', default=5e-5, type=float,
                         help='L2 regularization (only applied to the weight norm scale factors)')
+
+    parser.add_argument('--vae_model_path', default="vae_ckpts/vae_n_decoder_n_latent_cifar_model_0501.pt",
+                       type=str, help='')
+    parser.add_argument('--vae_optim_path', default="vae_n_decoder_n_latent_cifar_optim_0501.pt",
+                        type=str, help='')
 
     best_loss = 0
     global_step = 0

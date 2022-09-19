@@ -1,6 +1,8 @@
 import numpy as np
+import torch
 import torch.nn as nn
 import torch.nn.utils as utils
+from torch.distributions import Independent, Normal
 
 
 def bits_per_dim(x, nll):
@@ -42,15 +44,32 @@ class NLLLoss(nn.Module):
     See Also:
         Equation (3) in the RealNVP paper: https://arxiv.org/abs/1605.08803
     """
-    def __init__(self, k=256):
+
+    def __init__(self, k=256, color_channels=3):
         super(NLLLoss, self).__init__()
         self.k = k
+        self.color_channels = color_channels
 
-    def forward(self, z, sldj):
-        prior_ll = -0.5 * (z ** 2 + np.log(2 * np.pi))
-        prior_ll = prior_ll.flatten(1).sum(-1) \
-            - np.log(self.k) * np.prod(z.size()[1:])
+    def forward(self, z, sldj, mu_d, logvar_d):
+        # vae both lr
+        # sigma = torch.exp(logvar_d) + 0.001
+        # dist = LowRankMultivariateNormal(mu_d, u_d.view(-1, u_d.shape[1], 1), sigma)
+        # d = dist.log_prob(z.view(-1, z.shape[2] * z.shape[2] * self.color_channels))
+
+        # vae both n
+        dist = Independent(Normal(loc=mu_d, scale=torch.exp(logvar_d)), 1)
+        d = dist.log_prob(z.view(-1, z.shape[2] * z.shape[2] * self.color_channels))
+
+        # last
+        # prior_ll = -0.5 * (z ** 2 + np.log(2 * np.pi))
+        # prior_ll = prior_ll.flatten(1).sum(-1) \
+        #            - np.log(self.k) * np.prod(z.size()[1:])
+        # ll = prior_ll + sldj
+
+        prior_ll = d \
+                   - np.log(self.k) * np.prod(z.size()[1:])
         ll = prior_ll + sldj
+
         nll = -ll.mean()
 
         return nll
